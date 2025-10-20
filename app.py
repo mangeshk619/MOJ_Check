@@ -1,5 +1,7 @@
 import io
 import re
+import json
+import zipfile
 from datetime import datetime
 import pandas as pd
 import streamlit as st
@@ -20,7 +22,7 @@ glossary_file = st.sidebar.file_uploader(
 run = st.sidebar.button("Run QA", type="primary")
 
 st.title("🈶 Translation QA – Traditional Chinese")
-st.caption("Checks: Typographical errors • Terminology consistency • Extra spaces • Duplicated footnote numbers")
+st.caption("Checks: Typographical errors • Terminology consistency • Extra spaces • Duplicated footnote numbers • Downloadable reports (CSV/XLSX/ZIP)")
 
 # ── Helper functions
 
@@ -89,8 +91,8 @@ def load_glossary(file):
         if not c_pref and "zh_pref" in df.columns: c_pref = "zh_pref"
         if not c_var and "zh_variants" in df.columns: c_var = "zh_variants"
 
-        # If any missing, show a quick UI to map
-        if not all([c_pref]):
+        # If any missing, show a quick UI to map (preferred is required)
+        if not c_pref:
             st.info("Map glossary columns below (only preferred zh term is required).")
             c_en = st.selectbox("Column for English term (optional)", [None] + list(df.columns), index=(list(df.columns).index(c_en) + 1) if c_en in df.columns else 0, key="map_en")
             c_pref = st.selectbox("Column for Preferred zh‑TW term (required)", list(df.columns), index=list(df.columns).index(c_pref) if c_pref in df.columns else 0, key="map_pref")
@@ -109,13 +111,19 @@ def load_glossary(file):
         return pd.DataFrame(columns=["en", "zh_pref", "zh_variants"])
 
 
+def context_snippet(text: str, start: int, length: int, pad: int = 32) -> str:
+    s = max(0, start - pad)
+    e = min(len(text), start + length + pad)
+    return text[s:e].replace("\n", " ")
+
+
 def check_extra_spaces(text):
     # CJK U+4E00–U+9FFF with ASCII/half-width spaces
     pattern = re.compile(r"([\u4e00-\u9fff])[ \t]+([\u4e00-\u9fff])")
-    findings = [(m.start(), m.group()) for m in pattern.finditer(text)]
+    findings = [(m.start(0), len(m.group(0)), m.group(0)) for m in pattern.finditer(text)]
     # Full‑width space U+3000 between CJK
     fw = re.compile(r"([\u4e00-\u9fff])\u3000+([\u4e00-\u9fff])")
-    findings += [(m.start(), m.group()) for m in fw.finditer(text)]
+    findings += [(m.start(0), len(m.group(0)), m.group(0)) for m in fw.finditer(text)]
     return findings
 
 
@@ -125,21 +133,29 @@ def check_typos(text):
     ascii_punct = r",\.;:!\?\)\(\[\]\{\}\"'"
     pattern = re.compile(fr"([\u4e00-\u9fff])([{ascii_punct}])([\u4e00-\u9fff])")
     for m in pattern.finditer(text):
-        issues.append((m.start(), m.group(2)))
+        issues.append((m.start(2), 1, m.group(2), "ASCII punctuation between CJK characters"))
+    # repeated CJK punctuation (e.g., 。。 or ！！)
+    rep = re.compile(r"([，。；：？！、])\1+")
+    for m in rep.finditer(text):
+        issues.append((m.start(0), len(m.group(0)), m.group(0), "Repeated punctuation"))
     # mismatched brackets (simple heuristic)
     pairs = {"（": "）", "《": "》", "「": "」", "『": "』", "【": "】", "(": ")", "[": "]", "{": "}"}
     opens, closes = set(pairs.keys()), set(pairs.values())
     stack = []
     for i, ch in enumerate(text):
         if ch in opens:
-            stack.append(ch)
+            stack.append((ch, i))
         elif ch in closes:
-            if not stack or pairs.get(stack[-1], None) != ch:
-                issues.append((i, f"unexpected '{ch}'"))
+            if not stack or pairs.get(stack[-1][0]) != ch:
+                issues.append((i, 1, ch, "Unexpected closing bracket/quote"))
             else:
                 stack.pop()
-    for ch in stack:
-        issues.append((len(text), f"unclosed '{ch}'"))
+    for ch, pos in stack:
+        issues.append((pos, 1, ch, "Unclosed opening bracket/quote"))
+    # zero-width / BOM
+    for zw in ["\u200b", "\u200c", "\u200d", "\ufeff"]:
+        for m in re.finditer(zw, text):
+            issues.append((m.start(0), 1, zw, "Zero-width/BOM character"))
     return issues
 
 
@@ -150,9 +166,9 @@ def check_duplicate_footnotes(text):
     for m in pattern.finditer(text):
         num = m.group(1) or m.group(2) or m.group(3)
         if num in found:
-            duplicates.append((num, m.start()))
+            duplicates.append((m.start(0), len(m.group(0)), num))
         else:
-            found[num] = m.start()
+            found[num] = m.start(0)
     # superscript ¹²³
     supmap = {"⁰":0,"¹":1,"²":2,"³":3,"⁴":4,"⁵":5,"⁶":6,"⁷":7,"⁸":8,"⁹":9}
     i = 0
@@ -164,7 +180,7 @@ def check_duplicate_footnotes(text):
                 j+=1
             key = str(val)
             if key in found:
-                duplicates.append((key, i))
+                duplicates.append((i, j-i, key))
             else:
                 found[key] = i
             i=j
@@ -194,6 +210,26 @@ def check_terminology_inconsistency(target, glossary_df):
                 "found": ", ".join(f"{k} ({v})" for k, v in used_terms.items())
             })
     return inconsistencies
+
+
+def context_df(label, text, items):
+    # items are tuples (start, length, token/frag/num, optional note)
+    rows = []
+    for tup in items:
+        if len(tup) == 3:
+            pos, length, token = tup
+            note = ""
+        else:
+            pos, length, token, note = tup
+        rows.append({
+            "issue": label,
+            "detail": note or token,
+            "start": pos,
+            "end": pos + length,
+            "context": context_snippet(text, pos, length),
+        })
+    return pd.DataFrame(rows)
+
 
 # ── Main Execution
 if run:
@@ -229,14 +265,81 @@ if run:
 
     st.markdown("---")
 
-    st.subheader("📝 Detailed Results")
-    st.write("**Extra Spaces Found:**", spaces[:20])
-    st.write("**Typographical Issues:**", typos[:20])
-    st.write("**Duplicate Footnotes:**", duplicates[:20])
-    if glossary_df.empty:
-        st.info("No glossary uploaded, skipping terminology check.")
-    else:
-        st.write("**Terminology Inconsistencies:**", inconsistencies[:20])
+    st.subheader("📝 Detailed Results & Downloads")
+
+    df_spaces = context_df("Extra space", target_text, spaces)
+    df_typos = context_df("Typographical", target_text, typos)
+    df_foot = context_df("Duplicated footnote", target_text, duplicates)
+    df_terms = pd.DataFrame(inconsistencies)
+
+    with st.expander("Extra spaces (details)", expanded=bool(len(df_spaces))):
+        st.dataframe(df_spaces, use_container_width=True)
+        csv_spaces = df_spaces.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download CSV", data=csv_spaces, file_name="extra_spaces.csv")
+
+    with st.expander("Typographical issues (details)", expanded=False):
+        st.dataframe(df_typos, use_container_width=True)
+        csv_typos = df_typos.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download CSV", data=csv_typos, file_name="typographical_issues.csv")
+
+    with st.expander("Duplicated footnotes (details)", expanded=False):
+        st.dataframe(df_foot, use_container_width=True)
+        csv_foot = df_foot.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download CSV", data=csv_foot, file_name="duplicated_footnotes.csv")
+
+    with st.expander("Terminology inconsistencies (details)", expanded=False):
+        if glossary_df.empty:
+            st.info("No glossary uploaded, skipping terminology check.")
+            csv_terms = b""
+        else:
+            st.dataframe(df_terms, use_container_width=True)
+            csv_terms = df_terms.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Download CSV", data=csv_terms, file_name="terminology_inconsistencies.csv")
+
+    # Combined XLSX
+    with io.BytesIO() as bio:
+        with pd.ExcelWriter(bio, engine="openpyxl") as xw:
+            df_spaces.to_excel(xw, index=False, sheet_name="ExtraSpaces")
+            df_typos.to_excel(xw, index=False, sheet_name="TypoIssues")
+            df_foot.to_excel(xw, index=False, sheet_name="Footnotes")
+            df_terms.to_excel(xw, index=False, sheet_name="Terminology")
+        xlsx_bytes = bio.getvalue()
+        st.download_button(
+            "⬇️ Download ALL findings (XLSX)",
+            data=xlsx_bytes,
+            file_name="zhTW_QA_findings.xlsx",
+            use_container_width=True,
+        )
+
+    # ZIP export (CSVs + XLSX + previews + metadata)
+    with io.BytesIO() as zbio:
+        with zipfile.ZipFile(zbio, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            # CSVs
+            zf.writestr("findings/extra_spaces.csv", csv_spaces)
+            zf.writestr("findings/typographical_issues.csv", csv_typos)
+            zf.writestr("findings/duplicated_footnotes.csv", csv_foot)
+            if csv_terms:
+                zf.writestr("findings/terminology_inconsistencies.csv", csv_terms)
+            # XLSX
+            zf.writestr("findings/zhTW_QA_findings.xlsx", xlsx_bytes)
+            # Previews (limit large text to ~100k chars)
+            zf.writestr("previews/source_preview.txt", (source_text or "")[0:100000])
+            zf.writestr("previews/target_preview.txt", (target_text or "")[0:100000])
+            # Metadata
+            meta = {
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "source_name": getattr(source_file, "name", None),
+                "target_name": getattr(target_file, "name", None),
+                "glossary_name": getattr(glossary_file, "name", None),
+                "counts": results,
+            }
+            zf.writestr("metadata.json", json.dumps(meta, ensure_ascii=False, indent=2))
+        st.download_button(
+            "⬇️ Download ZIP (CSVs + XLSX + previews + metadata)",
+            data=zbio.getvalue(),
+            file_name="zhTW_QA_package.zip",
+            use_container_width=True,
+        )
 
 else:
     st.info("⬅️ Upload your English source, Traditional Chinese target, and optional glossary (CSV/XLSX). Then click Run QA.")
